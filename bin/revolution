@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""
+Revolution 2 CLI
+macOS native local two-person chat application
+Homage: The Beatles already made Revolution 1, so this is Revolution 2.
+"""
+
+import sys
+import os
+import json
+import argparse
+import uuid
+import datetime
+from pathlib import Path
+
+CURRENT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(CURRENT_DIR))
+
+from revolution_core import (
+    now_iso,
+    DATA_DIR,
+    CHATS_FILE,
+    STATUS_FILE,
+    SOCKET_PATH,
+    send_ipc,
+    read_store,
+    write_store,
+    resolve_chat,
+    wait_for_reply
+)
+
+def cmd_list(args):
+    ipc_res = send_ipc("list_chats")
+    if ipc_res and ipc_res.get("status") == "ok":
+        chats = ipc_res.get("chats", [])
+        active_id = ipc_res.get("activeChatId")
+    else:
+        store = read_store()
+        chats = store.get("chats", [])
+        active_id = store.get("activeChatId")
+
+    if not chats:
+        print("No conversations found. Create one with `revolution new --p1 John --p2 Paul`")
+        return
+
+    print("\n  REVOLUTION 2 CONVERSATIONS")
+    print("  " + "─" * 68)
+    print(f"  {'ACT':<4} {'ID':<10} {'TITLE':<24} {'PARTICIPANTS':<20} {'TURN':<10}")
+    print("  " + "─" * 68)
+    for c in chats:
+        is_active = "*" if c["id"].lower() == (active_id or "").lower() else " "
+        short_id = c["id"][:8]
+        title = (c["title"][:22] + "..") if len(c["title"]) > 22 else c["title"]
+        participants = f"{c['person1']} & {c['person2']}"
+        if len(participants) > 18:
+            participants = participants[:16] + ".."
+        turn = c.get("nextSpeaker", "")
+        print(f"  [{is_active}] {short_id:<10} {title:<24} {participants:<20} {turn:<10}")
+    print("  " + "─" * 68 + "\n")
+
+def cmd_new(args):
+    title = args.title or f"Chat with {args.p1} & {args.p2}"
+    first = args.first or args.p1
+    
+    ipc_res = send_ipc("create_chat", title=title, person1=args.p1, person2=args.p2, firstSpeaker=first)
+    if ipc_res and ipc_res.get("status") == "ok":
+        chat_id = ipc_res.get("chatId")
+        print(f"✓ Created conversation '{title}' [ID: {chat_id[:8]}]")
+        print(f"  Participants: {args.p1} & {args.p2}")
+        print(f"  First speaker: {ipc_res.get('nextSpeaker')}")
+        return
+
+    store = read_store()
+    c_id = str(uuid.uuid4()).upper()
+    now = now_iso()
+    new_chat = {
+        "id": c_id,
+        "title": title,
+        "person1": args.p1,
+        "person2": args.p2,
+        "nextSpeaker": first,
+        "createdAt": now,
+        "updatedAt": now,
+        "messages": []
+    }
+    store["chats"].insert(0, new_chat)
+    store["activeChatId"] = c_id
+    write_store(store)
+    print(f"✓ Created conversation '{title}' [ID: {c_id[:8]}]")
+    print(f"  Participants: {args.p1} & {args.p2}")
+    print(f"  First speaker: {first}")
+
+def cmd_send(args):
+    text = " ".join(args.message) if isinstance(args.message, list) else args.message
+    if not text.strip():
+        print("Error: Message text cannot be empty.", file=sys.stderr)
+        sys.exit(1)
+
+    ipc_res = send_ipc("send_message", text=text, chatId=args.chat, sender=args.sender)
+    if ipc_res and ipc_res.get("status") == "ok":
+        sender = ipc_res.get("sender")
+        next_spk = ipc_res.get("nextSpeaker")
+        chat_id = ipc_res.get("chatId")
+        store = read_store()
+        chat = resolve_chat(store.get("chats", []), store.get("activeChatId"), chat_id or args.chat)
+        msg_count = len(chat.get("messages", [])) if chat else None
+        print(f"✓ [{sender}]: {text}")
+        print(f"  → Next speaker: {next_spk}")
+    else:
+        store = read_store()
+        chats = store.get("chats", [])
+        active_id = store.get("activeChatId")
+        chat = resolve_chat(chats, active_id, args.chat)
+        if not chat:
+            print("Error: No conversation found to send message to.", file=sys.stderr)
+            sys.exit(1)
+
+        sender = args.sender.strip() if (args.sender and args.sender.strip()) else chat["nextSpeaker"]
+        msg_id = str(uuid.uuid4()).upper()
+        now = now_iso()
+        msg = {
+            "id": msg_id,
+            "chatId": chat["id"],
+            "sender": sender,
+            "text": text,
+            "timestamp": now
+        }
+        chat.setdefault("messages", []).append(msg)
+        chat["updatedAt"] = now
+
+        p1 = chat["person1"]
+        p2 = chat["person2"]
+        if sender.lower() == p1.lower():
+            chat["nextSpeaker"] = p2
+        elif sender.lower() == p2.lower():
+            chat["nextSpeaker"] = p1
+        else:
+            chat["nextSpeaker"] = p2 if chat["nextSpeaker"].lower() == p1.lower() else p1
+
+        next_spk = chat["nextSpeaker"]
+        msg_count = len(chat["messages"])
+        chat_id = chat["id"]
+        write_store(store)
+        print(f"✓ [{sender}]: {text}")
+        print(f"  → Next speaker: {next_spk}")
+
+    if getattr(args, "wait", False):
+        print(f"  ⏳ Waiting for {next_spk} to reply...", flush=True)
+        res = wait_for_reply(chat_query=chat_id or args.chat, after_count=msg_count, expected_turn=sender, timeout=args.timeout)
+        if res and res.get("reply"):
+            rep = res["reply"]
+            print(f"✓ Reply from [{rep['sender']}]: {rep['text']}")
+        else:
+            print("Timed out waiting for a reply.", file=sys.stderr)
+            sys.exit(1)
+
+def cmd_wait(args):
+    print("⏳ Waiting for next message...", flush=True)
+    res = wait_for_reply(chat_query=args.chat, expected_turn=args.turn, timeout=args.timeout)
+    if res and res.get("reply"):
+        rep = res["reply"]
+        print(f"✓ [{rep['sender']}]: {rep['text']}")
+        print(f"  → Next speaker: {res.get('nextSpeaker')}")
+    else:
+        print("Timed out waiting for a message.", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_show(args):
+    ipc_res = send_ipc("get_chat", chatId=args.chat)
+    if ipc_res and ipc_res.get("status") == "ok":
+        chat = ipc_res.get("chat")
+    else:
+        store = read_store()
+        chat = resolve_chat(store.get("chats", []), store.get("activeChatId"), args.chat)
+
+    if not chat:
+        print("Error: Conversation not found.", file=sys.stderr)
+        sys.exit(1)
+
+    p1 = chat["person1"]
+    p2 = chat["person2"]
+    next_speaker = chat["nextSpeaker"]
+    messages = chat.get("messages", [])
+
+    if args.tail and args.tail > 0:
+        messages = messages[-args.tail:]
+
+    print(f"\n  ═════════════════════════════════════════════════════════════")
+    print(f"  {chat['title'].upper()}")
+    print(f"  Participants: {p1} & {p2}  |  Next Speaker: {next_speaker}")
+    print(f"  ═════════════════════════════════════════════════════════════")
+
+    if not messages:
+        print(f"  (No messages yet. Scheduled to speak first: {next_speaker})")
+    else:
+        for m in messages:
+            sender = m["sender"]
+            text = m["text"]
+            ts = m.get("timestamp", "")
+            time_str = ""
+            if ts:
+                try:
+                    dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    time_str = dt.strftime("%I:%M %p")
+                except Exception:
+                    time_str = ts[:10]
+            
+            if sender.lower() == p1.lower():
+                print(f"  [{time_str}] {sender}: {text}")
+            else:
+                print(f"  [{time_str}]   >> {sender}: {text}")
+
+    print(f"  ─────────────────────────────────────────────────────────────")
+    print(f"  Turn: {next_speaker}\n")
+
+def cmd_turn(args):
+    store = read_store()
+    chat = resolve_chat(store.get("chats", []), store.get("activeChatId"), args.chat)
+    if not chat:
+        print("Error: Conversation not found.", file=sys.stderr)
+        sys.exit(1)
+    print(f"Next speaker in '{chat['title']}': {chat['nextSpeaker']}")
+
+def cmd_switch(args):
+    ipc_res = send_ipc("switch_speaker", chatId=args.chat)
+    if ipc_res and ipc_res.get("status") == "ok":
+        print(f"✓ Switched speaker. Next speaker: {ipc_res.get('nextSpeaker')}")
+        return
+
+    store = read_store()
+    chat = resolve_chat(store.get("chats", []), store.get("activeChatId"), args.chat)
+    if not chat:
+        print("Error: Conversation not found.", file=sys.stderr)
+        sys.exit(1)
+    p1 = chat["person1"]
+    p2 = chat["person2"]
+    chat["nextSpeaker"] = p2 if chat["nextSpeaker"].lower() == p1.lower() else p1
+    chat["updatedAt"] = now_iso()
+    write_store(store)
+    print(f"✓ Switched speaker. Next speaker: {chat['nextSpeaker']}")
+
+def cmd_select(args):
+    ipc_res = send_ipc("select_chat", chatId=args.chat)
+    store = read_store()
+    chat = resolve_chat(store.get("chats", []), store.get("activeChatId"), args.chat)
+    if not chat:
+        print("Error: Conversation not found.", file=sys.stderr)
+        sys.exit(1)
+    store["activeChatId"] = chat["id"]
+    write_store(store)
+    print(f"✓ Selected active conversation: '{chat['title']}' [{chat['id'][:8]}]")
+
+def cmd_clear(args):
+    ipc_res = send_ipc("clear_chat", chatId=args.chat)
+    store = read_store()
+    chat = resolve_chat(store.get("chats", []), store.get("activeChatId"), args.chat)
+    if not chat:
+        print("Error: Conversation not found.", file=sys.stderr)
+        sys.exit(1)
+    chat["messages"] = []
+    chat["updatedAt"] = now_iso()
+    write_store(store)
+    print(f"✓ Cleared messages in '{chat['title']}'")
+
+def cmd_delete(args):
+    ipc_res = send_ipc("delete_chat", chatId=args.chat)
+    store = read_store()
+    chat = resolve_chat(store.get("chats", []), store.get("activeChatId"), args.chat)
+    if not chat:
+        print("Error: Conversation not found.", file=sys.stderr)
+        sys.exit(1)
+    target_id = chat["id"]
+    store["chats"] = [c for c in store.get("chats", []) if c["id"] != target_id]
+    if store.get("activeChatId") == target_id:
+        store["activeChatId"] = store["chats"][0]["id"] if store["chats"] else None
+    write_store(store)
+    print(f"✓ Deleted conversation '{chat['title']}'")
+
+def cmd_open(args):
+    for candidate in [
+        Path("/Applications/Revolution 2.app"),
+        Path.home() / "Applications" / "Revolution 2.app",
+        CURRENT_DIR.parent / "Revolution 2.app"
+    ]:
+        if candidate.exists():
+            os.system(f"open '{candidate}'")
+            print(f"✓ Opened Revolution 2 ({candidate.name})")
+            return
+    os.system("open -a 'Revolution 2' 2>/dev/null || open 'Revolution 2.app'")
+    print("✓ Dispatched open command for Revolution 2")
+
+def cmd_status(args):
+    ipc_res = send_ipc("status")
+    print("\n  REVOLUTION 2 STATUS")
+    print("  " + "─" * 45)
+    print(f"  Storage Directory : {DATA_DIR}")
+    print(f"  Socket Path       : {SOCKET_PATH}")
+    if ipc_res and ipc_res.get("status") == "ok":
+        print(f"  App State         : Running (IPC Connected)")
+        print(f"  Active Chat ID    : {ipc_res.get('activeChatId', 'None')}")
+        print(f"  Total Chats       : {ipc_res.get('chatsCount', 0)}")
+    else:
+        running = False
+        for sf in [STATUS_FILE, Path("/tmp/revolution/app_status.json")]:
+            if sf.exists():
+                try:
+                    st = json.loads(sf.read_text())
+                    running = st.get("running", False)
+                    if running:
+                        break
+                except Exception:
+                    pass
+        print(f"  App State         : {'Running (Live File Sync)' if running else 'Not running (offline mode)'}")
+        store = read_store()
+        print(f"  Active Chat ID    : {store.get('activeChatId', 'None')}")
+        print(f"  Total Chats       : {len(store.get('chats', []))}")
+    print("  " + "─" * 45 + "\n")
+
+def cmd_guide(args):
+    print("""
+  ╔═════════════════════════════════════════════════════════════════════╗
+  ║                        REVOLUTION 2 GUIDE                           ║
+  ║     "The Beatles already made Revolution 1, so this is Revolution 2"║
+  ╚═════════════════════════════════════════════════════════════════════╝
+
+  KEYBOARD SHORTCUTS:
+  • Tab           : Instantly switch active speaker without losing text focus
+  • Return / Enter: Send message and automatically hand turn to the other person
+  • Cmd + N       : Create new conversation with custom participants & photos
+  • Cmd + E       : Edit participants or change photos
+  • Cmd + ,       : Open Preferences window
+  • Cmd + ?       : Guide to Revolution 2
+
+  TERMINAL COMMANDS:
+  • revolution list                    : List all chats and turn status
+  • revolution new --p1 "A" --p2 "B"   : Create new conversation
+  • revolution send "Hello"            : Send message (passes turn)
+  • revolution send "Hello" --wait     : Send message and wait for the other person's reply
+  • revolution wait                    : Wait for the next message in the active chat
+  • revolution show                    : View chat transcript
+  • revolution switch                  : Manually toggle next speaker
+  • revolution open                    : Launch Revolution 2 GUI app
+  • revolution status                  : Check socket and storage status
+""")
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="revolution",
+        description="Revolution 2 CLI"
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    p_list = subparsers.add_parser("list", help="List all conversations")
+    p_list.set_defaults(func=cmd_list)
+
+    p_new = subparsers.add_parser("new", help="Create a new conversation")
+    p_new.add_argument("--p1", required=True, help="Person 1 name (e.g. John)")
+    p_new.add_argument("--p2", required=True, help="Person 2 name (e.g. Paul)")
+    p_new.add_argument("--title", help="Conversation title")
+    p_new.add_argument("--first", help="Person who speaks first")
+    p_new.set_defaults(func=cmd_new)
+
+    p_send = subparsers.add_parser("send", help="Send a message (and optionally --wait for a reply)")
+    p_send.add_argument("message", nargs="+", help="Message content to send")
+    p_send.add_argument("--chat", help="Target chat ID or title snippet (defaults to active chat)")
+    p_send.add_argument("--sender", help="Override sender name (defaults to current turn)")
+    p_send.add_argument("--wait", "-w", action="store_true", help="Wait for the other person to reply and print their response")
+    p_send.add_argument("--timeout", type=float, default=300.0, help="Max seconds to wait when --wait is used (default: 300)")
+    p_send.set_defaults(func=cmd_send)
+
+    p_wait = subparsers.add_parser("wait", help="Wait for the next message or turn in a conversation")
+    p_wait.add_argument("--chat", help="Target chat ID or title snippet")
+    p_wait.add_argument("--turn", help="Wait specifically until it is this participant's turn")
+    p_wait.add_argument("--timeout", type=float, default=300.0, help="Max seconds to wait (default: 300)")
+    p_wait.set_defaults(func=cmd_wait)
+
+    p_show = subparsers.add_parser("show", help="View conversation transcript")
+    p_show.add_argument("--chat", help="Target chat ID or title snippet (defaults to active chat)")
+    p_show.add_argument("--tail", type=int, help="Number of recent messages to show")
+    p_show.set_defaults(func=cmd_show)
+
+    p_turn = subparsers.add_parser("turn", help="Show who speaks next")
+    p_turn.add_argument("--chat", help="Target chat ID or title snippet")
+    p_turn.set_defaults(func=cmd_turn)
+
+    p_switch = subparsers.add_parser("switch", help="Manually toggle the next speaker turn")
+    p_switch.add_argument("--chat", help="Target chat ID or title snippet")
+    p_switch.set_defaults(func=cmd_switch)
+
+    p_select = subparsers.add_parser("select", help="Set active conversation in GUI app")
+    p_select.add_argument("chat", help="Target chat ID or title snippet")
+    p_select.set_defaults(func=cmd_select)
+
+    p_clear = subparsers.add_parser("clear", help="Clear message transcript")
+    p_clear.add_argument("--chat", help="Target chat ID or title snippet")
+    p_clear.set_defaults(func=cmd_clear)
+
+    p_delete = subparsers.add_parser("delete", help="Delete a conversation")
+    p_delete.add_argument("chat", help="Target chat ID or title snippet")
+    p_delete.set_defaults(func=cmd_delete)
+
+    p_open = subparsers.add_parser("open", help="Launch or focus Revolution 2 macOS application")
+    p_open.set_defaults(func=cmd_open)
+
+    p_status = subparsers.add_parser("status", help="Show system and socket connection status")
+    p_status.set_defaults(func=cmd_status)
+
+    p_guide = subparsers.add_parser("guide", help="Show Revolution 2 guide and shortcuts")
+    p_guide.set_defaults(func=cmd_guide)
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
